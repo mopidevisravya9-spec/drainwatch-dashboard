@@ -1,717 +1,2026 @@
-import express from "express";
-import cors from "cors";
-import http from "http";
-import { WebSocketServer, WebSocket } from "ws";
+#!/usr/bin/env python3
+DRAIN_MODEL = "/home/pi/yolo/drain_best.pt"
+TRASH_MODEL = "/home/pi/yolo/trash_best.pt"
+# ============================================================
+# SMART DRAIN MONITORING SYSTEM
+# Raspberry Pi + ESP8266 + A7670C GSM + PiCamera2 + YOLO
+#
+# MAIN PROJECT ALERTS
+# 1. HEAVY WATER FLOW ALERT
+# 2. MUD BLOCKAGE ALERT
+#
+# IMPORTANT:
+# The A7670C only sends the SMS.
+# The Raspberry Pi decides which alert is required.
+# ============================================================
 
-const app = express();
+from picamera2 import Picamera2
+from ultralytics import YOLO
+import cv2
+import time
+import serial
+import serial.tools.list_ports
+import threading
+import re
+import requests
+import os
+from datetime import datetime, timezone
 
-app.use(cors());
-app.use(express.json({ limit: "12mb" }));
 
-const PORT = process.env.PORT || 10000;
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-// ======================================
-// TEMPORARY IN-MEMORY STORAGE
-// ======================================
+DATA_API = "http://10.45.119.45:8000/api/data"
+ALERT_API = "http://10.45.119.45:8000/api/alerts"
 
-let sensorData = [];
-let detections = [];
-let alerts = [];
+# ESP8266 UART/USB serial
+ESP_BAUD = 115200
 
-// ======================================
-// CAMERA STORAGE
-// ======================================
+# A7670C
+# You previously confirmed your A7670C setup is working at 115200.
+GSM_BAUD = 115200
 
-const cameraFrames = new Map();
-const cameraSnapshots = new Map();
+# Add all mobile numbers that should receive alerts.
+PHONE_NUMBERS = [
+    "+919390547987",
+    "+919177364716",
+    "+919505651480"
+]
 
-let nextSnapshotId = 1;
+# ============================================================
+# TELEGRAM ALERT CONFIGURATION
+# ============================================================
+TELEGRAM_BOT_TOKEN = "8692003378:AAGNBmJSotjt9MCPhRaAYC6YqrXcr4UDL0A"
+TELEGRAM_CHAT_ID = "-1004339935265"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-const MAX_SNAPSHOTS = 100;
-const MAX_FRAME_AGE_MS = 5000;
+SNAPSHOT_FOLDER = "incident_snapshots"
+os.makedirs(SNAPSHOT_FOLDER, exist_ok=True)
 
-// ======================================
-// TEST API
-// ======================================
+# Set a fixed GSM port here if you know it.
+# Examples:
+#   "/dev/serial0"
+#   "/dev/ttyUSB0"
+#   "/dev/ttyUSB1"
+#
+# None = automatically try common ports.
+GSM_PORT = "/dev/ttyAMA0"
 
-app.get("/", (req, res) => {
-  res.json({
-    status: "success",
-    message: "DrainWatch API is running"
-  });
-});
+# None = automatically find ESP8266 USB serial.
+ESP_PORT = None
 
-// ======================================
-// HEALTH CHECK
-// ======================================
+# Actual internal drain depth
+DRAIN_HEIGHT_CM = 200.0
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    camera_devices: cameraFrames.size
-  });
-});
+# High-water threshold
+WATER_LEVEL_HIGH_CM = 20.0
 
-// ======================================
-// RECEIVE SENSOR DATA
-// ======================================
+# ------------------------------------------------------------
+# HEAVY FLOW SETTING
+# ------------------------------------------------------------
+# YF-S201 flow value is expected from the ESP8266 as L/min.
+#
+# If water level is high AND flow >= this value AND there is
+# no confirmed blockage -> HEAVY WATER FLOW ALERT.
+#
+# CALIBRATE THIS VALUE for your prototype.
+HEAVY_FLOW_LPM = 10.0
 
-app.post("/api/data", (req, res) => {
-  console.log("Received sensor data:", req.body);
+# ------------------------------------------------------------
+# VISUAL BLOCKAGE DETECTION
+# ------------------------------------------------------------
+YOLO_CONFIDENCE = 0.30
 
-  const data = {
-    ...req.body,
-    received_at: new Date().toISOString()
-  };
+MUD_CLASS = "mud_buildup"
 
-  sensorData.push(data);
-
-  if (sensorData.length > 1000) {
-    sensorData.shift();
-  }
-
-  res.json({
-    status: "success",
-    message: "Data received successfully",
-    data: data
-  });
-});
-
-// ======================================
-// GET SENSOR DATA
-// ======================================
-
-app.get("/api/data", (req, res) => {
-  res.json({
-    status: "success",
-    data: sensorData
-  });
-});
-
-// ======================================
-// DEVICE HISTORY
-// ======================================
-
-app.get("/api/data/:device_id", (req, res) => {
-  const deviceId = req.params.device_id;
-
-  const deviceData = sensorData.filter(
-    (item) => item.device_id === deviceId
-  );
-
-  res.json({
-    status: "success",
-    device_id: deviceId,
-    data: deviceData
-  });
-});
-
-// ======================================
-// RECEIVE CAMERA DETECTIONS
-// ======================================
-
-app.post("/api/detections", (req, res) => {
-  console.log("Received detection:", req.body);
-
-  const detection = {
-    ...req.body,
-    received_at: new Date().toISOString()
-  };
-
-  detections.push(detection);
-
-  if (detections.length > 1000) {
-    detections.shift();
-  }
-
-  res.json({
-    status: "success",
-    message: "Detection received successfully",
-    data: detection
-  });
-});
-
-// ======================================
-// GET CAMERA DETECTIONS
-// ======================================
-
-app.get("/api/detections", (req, res) => {
-  res.json({
-    status: "success",
-    data: detections
-  });
-});
-
-// ======================================
-// RECEIVE ALERT
-// ======================================
-
-app.post("/api/alerts", (req, res) => {
-  console.log("Received alert:", req.body);
-
-  const alert = {
-    ...req.body,
-    received_at: new Date().toISOString()
-  };
-
-  alerts.push(alert);
-
-  if (alerts.length > 1000) {
-    alerts.shift();
-  }
-
-  res.json({
-    status: "success",
-    message: "Alert received successfully",
-    data: alert
-  });
-});
-
-// ======================================
-// GET ALERTS
-// ======================================
-
-app.get("/api/alerts", (req, res) => {
-  res.json({
-    status: "success",
-    data: alerts
-  });
-});
-
-// ======================================
-// CAMERA FRAME HELPER
-// ======================================
-
-function getFrame(deviceId) {
-  const item = cameraFrames.get(deviceId);
-
-  if (!item) {
-    return null;
-  }
-
-  if (Date.now() - item.updatedAt > MAX_FRAME_AGE_MS) {
-    return null;
-  }
-
-  return item;
+PLASTIC_CLASSES = {
+    "plastic-bag",
+    "plastic-garbage"
 }
 
-// ======================================
-// SNAPSHOT METADATA
-// ======================================
-
-function snapshotMeta(snapshot) {
-  return {
-    id: snapshot.id,
-    device_id: snapshot.device_id,
-    device_name: snapshot.device_name,
-    filename: snapshot.filename,
-    captured_at: snapshot.captured_at,
-    url: `/api/snapshots/${snapshot.id}`
-  };
+SAND_CLASSES = {
+    "sand",
+    "sand-buildup",
+    "sand_buildup",
+    "sand buildup"
 }
 
-// ======================================
-// CAMERA STATUS
-// ======================================
+# Number of consecutive camera frames required before
+# treating mud/plastic as a confirmed blockage condition.
+BLOCKAGE_CONFIRM_FRAMES = 5
 
-app.get("/api/camera/status", (req, res) => {
-  const result = {};
+# Number of consecutive readings required before treating
+# the water level as a confirmed high-water event.
+HIGH_WATER_CONFIRM_READINGS = 3
 
-  for (const [deviceId, item] of cameraFrames.entries()) {
-    result[deviceId] = {
-      online:
-        Date.now() - item.updatedAt <= MAX_FRAME_AGE_MS,
-      device_id: deviceId,
-      device_name: item.device_name,
-      last_frame_at:
-        new Date(item.updatedAt).toISOString()
-    };
-  }
+# Minimum time between SMS messages.
+SMS_COOLDOWN = 60
 
-  res.json({
-    status: "success",
-    data: result
-  });
-});
+# ============================================================
+# RENDER DASHBOARD API
+# ============================================================
 
-// ======================================
-// GET SNAPSHOT LIST
-// ======================================
+DATA_API = "http://10.45.119.45:8000/api/data"
+ALERT_API = "http://10.45.119.45:8000/api/alerts"
 
-app.get("/api/snapshots", (req, res) => {
-  const deviceId = req.query.device_id;
+DEVICE_ID = "ESP8266-DRAIN-001"
+DEVICE_NAME = "Drain 1"
 
-  let list = Array.from(cameraSnapshots.values());
+DEVICE_LATITUDE = 17.44716
+DEVICE_LONGITUDE = 78.4786
 
-  if (deviceId) {
-    list = list.filter(
-      (item) => item.device_id === deviceId
-    );
-  }
+# Send live sensor data to dashboard every 5 seconds.
+DATA_API_INTERVAL = 5
+API_TIMEOUT = 8
 
-  list.sort((a, b) => b.id - a.id);
+last_data_api_time = 0
 
-  res.json({
-    status: "success",
-    data: list.map(snapshotMeta)
-  });
-});
 
-// ======================================
-// GET ONE SNAPSHOT
-// ======================================
+# ============================================================
+# SHARED SENSOR DATA
+# ============================================================
 
-app.get("/api/snapshots/:id", (req, res) => {
-  const id = Number(req.params.id);
+sensor_data = {
+    "temperature": None,
+    "mq135": None,
+    "distance": None,
+    "level": None,
+    "flow": None
+}
 
-  const snapshot = cameraSnapshots.get(id);
+data_lock = threading.Lock()
 
-  if (!snapshot) {
-    return res.status(404).json({
-      status: "error",
-      message: "Snapshot not found"
-    });
-  }
+esp_serial = None
+gsm_serial = None
 
-  res.setHeader(
-    "Content-Type",
-    snapshot.contentType || "image/jpeg"
-  );
 
-  res.setHeader(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate, max-age=0"
-  );
+# ============================================================
+# HELPER
+# ============================================================
 
-  return res.send(snapshot.buffer);
-});
+def extract_number(text):
+    """
+    Extract the first signed integer/decimal number from text.
+    """
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
 
-// ======================================
-// RECEIVE SNAPSHOT FROM RASPBERRY PI
-// ======================================
+    if match:
+        return float(match.group())
 
-app.post("/api/snapshots/upload", (req, res) => {
-  try {
-    const {
-      device_id,
-      device_name,
-      filename,
-      captured_at,
-      content_type,
-      image_base64
-    } = req.body || {};
+    return None
 
-    if (!device_id || !image_base64) {
-      return res.status(400).json({
-        status: "error",
-        message:
-          "device_id and image_base64 are required"
-      });
+
+
+# ============================================================
+# RENDER API FUNCTIONS
+# ============================================================
+
+def post_json_api(url, payload):
+    """POST JSON to the Render dashboard API."""
+
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=API_TIMEOUT
+        )
+
+        print(
+            f"\nAPI POST: {url}"
+        )
+        print(
+            f"API STATUS: {response.status_code}"
+        )
+
+        if response.text.strip():
+            print(
+                f"API RESPONSE: {response.text[:300]}"
+            )
+
+        return 200 <= response.status_code < 300
+
+    except requests.exceptions.RequestException as e:
+        print(
+            f"\nAPI CONNECTION ERROR: {e}"
+        )
+        return False
+
+    except Exception as e:
+        print(
+            f"\nAPI ERROR: {e}"
+        )
+        return False
+
+
+def send_dashboard_data(
+    level,
+    flow,
+    temperature,
+    mq135,
+    system_status
+):
+    """
+    Send dashboard sensor JSON.
+
+    velocity_mps is null until the velocity sensor is connected.
+    humidity_pct is null because no humidity sensor is currently
+    present in this code.
+    gas_ppm is null because MQ-135 currently provides ADC,
+    not calibrated PPM.
+    """
+
+    if level is not None:
+        water_level_pct = (
+            level / DRAIN_HEIGHT_CM
+        ) * 100.0
+
+        water_level_pct = max(
+            0.0,
+            min(100.0, water_level_pct)
+        )
+    else:
+        water_level_pct = None
+
+    payload = {
+        "device_id": DEVICE_ID,
+        "device_name": DEVICE_NAME,
+        "latitude": DEVICE_LATITUDE,
+        "longitude": DEVICE_LONGITUDE,
+        "status": "online",
+        "water_level_pct": (
+            round(water_level_pct, 1)
+            if water_level_pct is not None
+            else None
+        ),
+        "velocity_mps": None,
+        "temperature_c": (
+            round(temperature, 1)
+            if temperature is not None
+            else None
+        ),
+        "humidity_pct": None,
+        "gas_ppm": None,
+        "timestamp": datetime.now(
+            timezone.utc
+        ).replace(
+            microsecond=0
+        ).isoformat()
     }
 
-    const cleanBase64 =
-      String(image_base64).replace(
-        /^data:image\/[^;]+;base64,/i,
-        ""
-      );
+    return post_json_api(
+        DATA_API,
+        payload
+    )
 
-    const buffer = Buffer.from(
-      cleanBase64,
-      "base64"
-    );
 
-    if (!buffer.length) {
-      return res.status(400).json({
-        status: "error",
-        message: "Invalid image data"
-      });
+def send_dashboard_alert(
+    alert_type,
+    level,
+    flow,
+    mud_confidence,
+    plastic_confidence
+):
+    """Send a detected alert event to the dashboard."""
+
+    if alert_type == "HEAVY_FLOW":
+        alert_name = "HEAVY WATER FLOW ALERT"
+
+    elif alert_type == "MUD_BLOCKAGE":
+        alert_name = "MUD BLOCKAGE ALERT"
+
+    else:
+        alert_name = str(alert_type)
+
+    payload = {
+        "device_id": DEVICE_ID,
+        "device_name": DEVICE_NAME,
+        "alert_type": alert_type,
+        "alert": alert_name,
+        "status": "alert",
+        "water_level_cm": (
+            round(level, 1)
+            if level is not None
+            else None
+        ),
+        "velocity_mps": None,
+        "flow_lpm": (
+            round(flow, 2)
+            if flow is not None
+            else None
+        ),
+        "mud_confidence": (
+            round(mud_confidence, 3)
+            if mud_confidence is not None
+            else None
+        ),
+        "plastic_confidence": (
+            round(plastic_confidence, 3)
+            if plastic_confidence is not None
+            else None
+        ),
+        "timestamp": datetime.now(
+            timezone.utc
+        ).replace(
+            microsecond=0
+        ).isoformat()
     }
 
-    const id = nextSnapshotId++;
-
-    const safeFilename =
-      filename || `snapshot_${id}.jpg`;
-
-    const snapshot = {
-      id,
-      device_id: String(device_id),
-      device_name: String(
-        device_name || device_id
-      ),
-      filename: safeFilename,
-      captured_at:
-        captured_at ||
-        new Date().toISOString(),
-      contentType:
-        content_type || "image/jpeg",
-      buffer
-    };
-
-    cameraSnapshots.set(id, snapshot);
-
-    while (
-      cameraSnapshots.size > MAX_SNAPSHOTS
-    ) {
-      const oldestId =
-        cameraSnapshots.keys().next().value;
-
-      cameraSnapshots.delete(oldestId);
-    }
-
-    console.log(
-      `Camera snapshot received: ${snapshot.device_id} #${snapshot.id}`
-    );
-
-    return res.json({
-      status: "success",
-      message:
-        "Snapshot uploaded successfully",
-      data: snapshotMeta(snapshot)
-    });
-
-  } catch (error) {
-    console.error(
-      "Snapshot upload error:",
-      error
-    );
-
-    return res.status(500).json({
-      status: "error",
-      message: "Snapshot upload failed"
-    });
-  }
-});
-
-// ======================================
-// CREATE HTTP SERVER
-// ======================================
-
-const server = http.createServer(app);
-
-// ======================================
-// CAMERA WEBSOCKET SERVER
-// ======================================
-
-const cameraWss =
-  new WebSocketServer({
-    server,
-    path: "/ws/camera"
-  });
-
-cameraWss.on(
-  "connection",
-  (ws, req) => {
-
-    let deviceId = null;
-    let deviceName = null;
-    let role = "unknown";
-
-    console.log(
-      "Camera WebSocket connected:",
-      req.socket.remoteAddress
-    );
-
-    ws.on(
-      "message",
-      (message, isBinary) => {
-
-        try {
-
-          // ====================================
-          // TEXT MESSAGE
-          // ====================================
-
-          if (!isBinary) {
-
-            const text =
-              message.toString();
-
-            const data =
-              JSON.parse(text);
+    return post_json_api(
+        ALERT_API,
+        payload
+    )
 
-            // ------------------------------
-            // PI REGISTRATION
-            // ------------------------------
-
-            if (data.type === "register") {
 
-              deviceId =
-                String(
-                  data.device_id || ""
-                );
+# ============================================================
+# ESP8266 PORT DETECTION
+# ============================================================
 
-              deviceName =
-                String(
-                  data.device_name ||
-                  deviceId
-                );
+def find_esp_port():
+    """
+    Automatically find a likely ESP8266 USB serial port.
 
-              role = "pi";
+    If ESP_PORT is manually configured, that port is used instead.
+    """
 
-              if (!deviceId) {
+    if ESP_PORT:
+        return ESP_PORT
 
-                ws.close(
-                  1008,
-                  "device_id is required"
-                );
+    ports = list(serial.tools.list_ports.comports())
 
-                return;
-              }
+    if not ports:
+        return None
 
-              ws.deviceId = deviceId;
-              ws.deviceName = deviceName;
-              ws.role = "pi";
+    print()
+    print("Available serial devices:")
 
-              if (cameraFrames.has(deviceId)) {
+    for port in ports:
+        print(
+            f"  {port.device} - "
+            f"{port.description or 'No description'}"
+        )
 
-                cameraFrames.get(
-                  deviceId
-                ).producer = ws;
+    preferred = []
 
-              }
+    for port in ports:
 
-              ws.send(
-                JSON.stringify({
-                  type: "registered",
-                  device_id: deviceId,
-                  device_name: deviceName
-                })
-              );
+        # Do not select the GSM port if it is already open.
+        if (
+            gsm_serial is not None
+            and port.device == gsm_serial.port
+        ):
+            continue
 
-              console.log(
-                `Camera producer registered: ${deviceId}`
-              );
+        device = port.device.lower()
 
-              return;
-            }
+        description = (
+            port.description or ""
+        ).lower()
 
-            // ------------------------------
-            // BROWSER VIEWER
-            // ------------------------------
-
-            if (data.type === "viewer") {
+        manufacturer = (
+            port.manufacturer or ""
+        ).lower()
 
-              ws.role = "viewer";
-
-              ws.deviceId =
-                String(
-                  data.device_id || ""
-                );
-
-              if (!ws.deviceId) {
-
-                ws.close(
-                  1008,
-                  "device_id is required"
-                );
-
-                return;
-              }
-
-              ws.send(
-                JSON.stringify({
-                  type:
-                    "viewer_registered",
-                  device_id:
-                    ws.deviceId
-                })
-              );
-
-              const frame =
-                getFrame(
-                  ws.deviceId
-                );
-
-              if (
-                frame &&
-                ws.readyState ===
-                  WebSocket.OPEN
-              ) {
-
-                ws.send(
-                  frame.buffer,
-                  { binary: true }
-                );
-
-              }
-
-              console.log(
-                `Camera viewer registered: ${ws.deviceId}`
-              );
-
-              return;
-            }
-
-            return;
-          }
-
-          // ====================================
-          // BINARY MESSAGE = CAMERA FRAME
-          // ====================================
-
-          if (
-            !deviceId ||
-            role !== "pi"
-          ) {
-            return;
-          }
-
-          const buffer =
-            Buffer.from(message);
-
-          if (!buffer.length) {
-            return;
-          }
-
-          cameraFrames.set(
-            deviceId,
-            {
-              device_id:
-                deviceId,
-
-              device_name:
-                deviceName ||
-                deviceId,
-
-              buffer:
-                buffer,
-
-              updatedAt:
-                Date.now(),
-
-              producer:
-                ws
-            }
-          );
-
-          // Send frame to viewers
-          for (
-            const client
-            of cameraWss.clients
-          ) {
-
-            if (client === ws) {
-              continue;
-            }
-
-            if (
-              client.readyState !==
-              WebSocket.OPEN
-            ) {
-              continue;
-            }
-
-            if (
-              client.role ===
-                "viewer" &&
-              client.deviceId ===
-                deviceId
-            ) {
-
-              try {
-
-                client.send(
-                  buffer,
-                  {
-                    binary: true
-                  }
-                );
-
-              } catch (
-                error
-              ) {
-
-                console.error(
-                  "Camera viewer send error:",
-                  error.message
-                );
-
-              }
-
-            }
-
-          }
-
-        } catch (error) {
-
-          console.error(
-            "Camera WebSocket message error:",
-            error
-          );
-
-        }
-
-      }
-    );
-
-    ws.on(
-      "close",
-      () => {
-
-        console.log(
-          `Camera WebSocket closed: ${
-            deviceId || "unknown"
-          } (${role})`
-        );
+        text = (
+            description
+            + " "
+            + manufacturer
+        )
 
         if (
-          role === "pi" &&
-          deviceId
-        ) {
+            "usb" in device
+            or
+            "cp210" in text
+            or
+            "ch340" in text
+            or
+            "ch341" in text
+            or
+            "silicon labs" in text
+            or
+            "esp" in text
+        ):
+            preferred.append(port.device)
 
-          const stored =
-            cameraFrames.get(
-              deviceId
-            );
+    if preferred:
+        return preferred[0]
 
-          if (
-            stored &&
-            stored.producer === ws
-          ) {
+    # Return the first non-GSM device.
+    for port in ports:
+        if (
+            gsm_serial is None
+            or port.device != gsm_serial.port
+        ):
+            return port.device
 
-            cameraFrames.delete(
-              deviceId
-            );
+    return None
 
-          }
 
+# ============================================================
+# GSM PORT LIST
+# ============================================================
+
+def get_gsm_ports():
+
+    if GSM_PORT:
+        return [GSM_PORT]
+
+    return [
+        "/dev/ttyUSB0",
+        "/dev/ttyUSB1",
+        "/dev/ttyUSB2",
+        "/dev/serial0",
+        "/dev/ttyAMA0",
+        "/dev/ttyAMA1"
+    ]
+
+
+# ============================================================
+# CONNECT GSM / A7670C
+# ============================================================
+
+def gsm_command(command, wait=1.0):
+    """
+    Send an AT command and return the modem response.
+    """
+
+    global gsm_serial
+
+    if gsm_serial is None:
+        return ""
+
+    try:
+        gsm_serial.reset_input_buffer()
+        gsm_serial.write((command + "\r").encode())
+        gsm_serial.flush()
+
+        time.sleep(wait)
+
+        response = (
+            gsm_serial.read_all()
+            .decode(
+                "utf-8",
+                errors="ignore"
+            )
+        )
+
+        print(
+            f"\nGSM AT: {command}"
+        )
+        print(
+            f"GSM RX: {response.strip()}"
+        )
+
+        return response
+
+    except Exception as e:
+
+        print(
+            f"GSM command error ({command}): {e}"
+        )
+
+        return ""
+
+
+def connect_gsm():
+
+    global gsm_serial
+
+    print()
+    print("==============================================")
+    print("             CONNECTING A7670C")
+    print("==============================================")
+
+    for port in get_gsm_ports():
+
+        try:
+
+            print(
+                f"Trying GSM port: {port}"
+            )
+
+            candidate = serial.Serial(
+                port=port,
+                baudrate=GSM_BAUD,
+                timeout=1,
+                write_timeout=2
+            )
+
+            gsm_serial = candidate
+
+            time.sleep(1)
+
+            # Basic modem test
+            response = gsm_command(
+                "AT",
+                wait=1
+            )
+
+            if "OK" not in response.upper():
+
+                print(
+                    f"A7670C did not answer on {port}"
+                )
+
+                candidate.close()
+                gsm_serial = None
+                continue
+
+            # Disable command echo
+            gsm_command(
+                "ATE0",
+                wait=0.5
+            )
+
+            # SMS text mode
+            response = gsm_command(
+                "AT+CMGF=1",
+                wait=0.5
+            )
+
+            if "OK" not in response.upper():
+
+                print(
+                    "Warning: SMS text mode was not accepted."
+                )
+
+            # Check SIM
+            gsm_command(
+                "AT+CPIN?",
+                wait=0.8
+            )
+
+            # Signal strength
+            gsm_command(
+                "AT+CSQ",
+                wait=0.8
+            )
+
+            # LTE registration
+            gsm_command(
+                "AT+CEREG?",
+                wait=0.8
+            )
+
+            # Operator information
+            gsm_command(
+                "AT+COPS?",
+                wait=0.8
+            )
+
+            print()
+            print(
+                f"A7670C GSM: READY on {port}"
+            )
+            print(
+                f"A7670C baud: {GSM_BAUD}"
+            )
+
+            return True
+
+        except Exception as e:
+
+            print(
+                f"GSM port {port} failed: {e}"
+            )
+
+            gsm_serial = None
+
+    print()
+    print(
+        "A7670C GSM: NOT CONNECTED"
+    )
+
+    print(
+        "Check power, UART/USB connection, SIM and baud rate."
+    )
+
+    return False
+
+
+# ============================================================
+# SEND SMS
+# ============================================================
+
+def send_sms(message):
+    """Send the same SMS alert to every number in PHONE_NUMBERS."""
+    global gsm_serial
+
+    if gsm_serial is None:
+        print("\nGSM unavailable - SMS not sent.")
+        return False
+
+    overall_success = True
+
+    for phone_number in PHONE_NUMBERS:
+        phone_number = phone_number.strip()
+        if not phone_number:
+            continue
+
+        try:
+            print()
+            print("==============================================")
+            print("             SENDING SMS ALERT")
+            print("==============================================")
+            print(f"SMS number: {phone_number}")
+
+            response = gsm_command("AT+CMGF=1", wait=0.5)
+
+            if "OK" not in response.upper():
+                print("SMS text mode failed.")
+                overall_success = False
+                continue
+
+            gsm_serial.reset_input_buffer()
+            gsm_serial.write(
+                ('AT+CMGS="' + phone_number + '"\r').encode()
+            )
+            gsm_serial.flush()
+
+            prompt = ""
+            start_time = time.time()
+
+            while time.time() - start_time < 8:
+                if gsm_serial.in_waiting:
+                    chunk = gsm_serial.read(
+                        gsm_serial.in_waiting
+                    ).decode("utf-8", errors="ignore")
+                    prompt += chunk
+                    print(f"GSM > {chunk}", end="")
+
+                    if ">" in prompt:
+                        break
+                    if "ERROR" in prompt.upper():
+                        break
+                time.sleep(0.1)
+
+            if ">" not in prompt:
+                print("\nSMS prompt '>' not received.")
+                overall_success = False
+                continue
+
+            gsm_serial.write(
+                message.encode("utf-8", errors="ignore")
+            )
+            gsm_serial.write(bytes([26]))
+            gsm_serial.flush()
+
+            print()
+            print("SMS message submitted. Waiting for modem...")
+
+            response = ""
+            start_time = time.time()
+
+            while time.time() - start_time < 30:
+                if gsm_serial.in_waiting:
+                    chunk = gsm_serial.read(
+                        gsm_serial.in_waiting
+                    ).decode("utf-8", errors="ignore")
+                    response += chunk
+                    print(chunk, end="")
+
+                    if (
+                        "OK" in response.upper()
+                        or "ERROR" in response.upper()
+                    ):
+                        break
+                time.sleep(0.2)
+
+            print()
+
+            if "OK" in response.upper():
+                print(
+                    f"SMS SENT SUCCESSFULLY to {phone_number}"
+                )
+            else:
+                print(
+                    f"SMS sending failed to {phone_number}."
+                )
+                overall_success = False
+
+        except Exception as e:
+            print(
+                f"\nSMS error for {phone_number}: {e}"
+            )
+            overall_success = False
+
+        time.sleep(2)
+
+    return overall_success
+
+
+# ============================================================
+# TELEGRAM ALERT FUNCTIONS
+# ============================================================
+
+def telegram_configured():
+    return (
+        TELEGRAM_BOT_TOKEN
+        and TELEGRAM_BOT_TOKEN != "PASTE_YOUR_BOT_TOKEN_HERE"
+        and TELEGRAM_CHAT_ID
+        and TELEGRAM_CHAT_ID != "PASTE_YOUR_GROUP_CHAT_ID_HERE"
+    )
+
+
+def send_telegram_message(message):
+    try:
+        if not telegram_configured():
+            print("\nTelegram is not configured yet.")
+            return False
+
+        response = requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=20
+        )
+
+        print(f"\nTELEGRAM MESSAGE STATUS: {response.status_code}")
+        print(f"TELEGRAM RESPONSE: {response.text[:500]}")
+
+        if response.ok:
+            print("Telegram alert sent successfully.")
+            return True
+
+        print("Telegram alert failed.")
+        return False
+
+    except Exception as e:
+        print(f"\nTelegram message error: {e}")
+        return False
+
+
+def send_telegram_snapshot(snapshot_path, caption):
+    try:
+        if not telegram_configured():
+            print("\nTelegram is not configured yet.")
+            return False
+
+        if not snapshot_path or not os.path.exists(snapshot_path):
+            print(f"Telegram snapshot file not found: {snapshot_path}")
+            return False
+
+        with open(snapshot_path, "rb") as photo:
+            response = requests.post(
+                f"{TELEGRAM_API}/sendPhoto",
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                files={"photo": photo},
+                timeout=30
+            )
+
+        print(f"\nTELEGRAM SNAPSHOT STATUS: {response.status_code}")
+        print(f"TELEGRAM SNAPSHOT RESPONSE: {response.text[:500]}")
+
+        if response.ok:
+            print("Telegram snapshot sent successfully.")
+            return True
+
+        print("Telegram snapshot failed.")
+        return False
+
+    except Exception as e:
+        print(f"\nTelegram snapshot error: {e}")
+        return False
+
+
+# ============================================================
+# CONNECT ESP8266
+# ============================================================
+
+def connect_esp():
+
+    global esp_serial
+
+    print()
+    print("==============================================")
+    print("              CONNECTING ESP8266")
+    print("==============================================")
+
+    port = find_esp_port()
+
+    if port is None:
+
+        print(
+            "ESP8266: NO SERIAL DEVICE FOUND"
+        )
+
+        return False
+
+    try:
+
+        esp_serial = serial.Serial(
+            port=port,
+            baudrate=ESP_BAUD,
+            timeout=0.2,
+            write_timeout=2
+        )
+
+        time.sleep(1)
+
+        print(
+            f"ESP8266: CONNECTED on {port}"
+        )
+
+        print(
+            f"ESP8266 baud: {ESP_BAUD}"
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "ESP8266 connection failed:"
+        )
+
+        print(e)
+
+        esp_serial = None
+
+        return False
+
+
+# ============================================================
+# ESP8266 SENSOR READER
+# ============================================================
+
+def read_esp8266():
+
+    print()
+    print(
+        "ESP8266 reader started."
+    )
+
+    while True:
+
+        if esp_serial is None:
+
+            time.sleep(1)
+            continue
+
+        try:
+
+            line = (
+                esp_serial
+                .readline()
+                .decode(
+                    "utf-8",
+                    errors="ignore"
+                )
+                .strip()
+            )
+
+            if not line:
+                continue
+
+            print(
+                f"\nESP > {line}"
+            )
+
+            # ------------------------------------------------
+            # TEMPERATURE
+            # ------------------------------------------------
+
+            if line.lower().startswith(
+                "temperature"
+            ):
+
+                value = extract_number(line)
+
+                if value is not None:
+
+                    with data_lock:
+
+                        sensor_data[
+                            "temperature"
+                        ] = value
+
+            # ------------------------------------------------
+            # MQ-135
+            # ------------------------------------------------
+
+            elif (
+                "mq-135" in line.lower()
+                or
+                "mq135" in line.lower()
+            ):
+
+                value = extract_number(line)
+
+                if value is not None:
+
+                    with data_lock:
+
+                        sensor_data[
+                            "mq135"
+                        ] = int(value)
+
+            # ------------------------------------------------
+            # A02YYUW WATER DISTANCE
+            # ------------------------------------------------
+
+            elif (
+                "water distance"
+                in line.lower()
+                or
+                "distance"
+                in line.lower()
+            ):
+
+                value = extract_number(line)
+
+                if value is not None:
+
+                    level = (
+                        DRAIN_HEIGHT_CM
+                        -
+                        value
+                    )
+
+                    level = max(
+                        0,
+                        min(
+                            DRAIN_HEIGHT_CM,
+                            level
+                        )
+                    )
+
+                    with data_lock:
+
+                        sensor_data[
+                            "distance"
+                        ] = value
+
+                        sensor_data[
+                            "level"
+                        ] = level
+
+            # ------------------------------------------------
+            # YF-S201 WATER FLOW
+            # ------------------------------------------------
+
+            elif (
+                "water flow"
+                in line.lower()
+                or
+                "flow"
+                in line.lower()
+                or
+                "l/min"
+                in line.lower()
+                or
+                "lpm"
+                in line.lower()
+            ):
+
+                value = extract_number(line)
+
+                if value is not None:
+
+                    with data_lock:
+
+                        sensor_data[
+                            "flow"
+                        ] = value
+
+        except Exception as e:
+
+            print(
+                "\nESP serial error:",
+                e
+            )
+
+            time.sleep(1)
+
+
+# ============================================================
+# LOAD YOLO MODELS
+# ============================================================
+
+print()
+print("==============================================")
+print("       SMART DRAIN MONITORING SYSTEM")
+print("==============================================")
+
+print()
+print(
+    "Loading DRAIN YOLO..."
+)
+
+drain_model = YOLO(
+    DRAIN_MODEL
+)
+
+print(
+    "DRAIN:",
+    drain_model.names
+)
+
+print()
+print(
+    "Loading TRASH YOLO..."
+)
+
+trash_model = YOLO(
+    TRASH_MODEL
+)
+
+print(
+    "TRASH:",
+    trash_model.names
+)
+
+
+# ============================================================
+# START CAMERA
+# ============================================================
+
+print()
+print(
+    "Starting camera..."
+)
+
+picam2 = Picamera2()
+
+camera_config = (
+    picam2.create_preview_configuration(
+        main={
+            "size": (640, 480),
+            "format": "RGB888"
+        }
+    )
+)
+
+picam2.configure(
+    camera_config
+)
+
+picam2.start()
+
+time.sleep(2)
+
+print(
+    "CAMERA: READY"
+)
+
+
+# ============================================================
+# START GSM FIRST
+# This prevents ESP auto-detection from taking the GSM port.
+# ============================================================
+
+gsm_ready = connect_gsm()
+
+
+# ============================================================
+# START ESP8266
+# ============================================================
+
+esp_ready = connect_esp()
+
+if esp_ready:
+
+    esp_thread = threading.Thread(
+        target=read_esp8266,
+        daemon=True
+    )
+
+    esp_thread.start()
+
+
+# ============================================================
+# SYSTEM STATUS
+# ============================================================
+
+print()
+print("==============================================")
+print("              SYSTEM READY")
+print("==============================================")
+
+print(
+    "DRAIN YOLO : READY"
+)
+
+print(
+    "TRASH YOLO : READY"
+)
+
+print(
+    "CAMERA     : READY"
+)
+
+print(
+    "ESP8266    :",
+    "READY" if esp_ready else "NOT CONNECTED"
+)
+
+print(
+    "A7670C GSM :",
+    "READY" if gsm_ready else "NOT CONNECTED"
+)
+
+print()
+print("MAIN ALERTS:")
+print("  1. HEAVY WATER FLOW ALERT")
+print("  2. MUD BLOCKAGE ALERT")
+print("  3. MUD / SAND / PLASTIC DETECTION ALERTS")
+print("  4. TELEGRAM SNAPSHOT ALERT")
+
+print()
+print("SENSORS:")
+print("  A02YYUW  -> Water level")
+print("  DS18B20  -> Temperature")
+print("  MQ-135   -> Gas")
+print("  YF-S201  -> Water flow")
+print("  PiCamera -> Mud / sand / plastic / blockage")
+
+print()
+print(
+    f"High water threshold : {WATER_LEVEL_HIGH_CM:.1f} cm"
+)
+
+print(
+    f"Heavy flow threshold : {HEAVY_FLOW_LPM:.1f} L/min"
+)
+
+print()
+print(
+    "Press Q to quit."
+)
+
+print(
+    "=============================================="
+)
+print()
+
+
+# ============================================================
+# ALERT STATE
+# ============================================================
+
+high_water_count = 0
+blockage_count = 0
+
+last_alert_type = None
+last_alert_time = 0
+
+# True after the water returns below the high-water threshold.
+# This allows a new event to generate a fresh SMS.
+event_reset = True
+
+
+# ============================================================
+# ALERT DECISION FUNCTION
+# ============================================================
+def determine_alert(
+    water_high,
+    flow,
+    mud_found,
+    sand_found,
+    plastic_found,
+    confirmed_blockage
+):
+    if water_high and confirmed_blockage:
+        return "MUD_BLOCKAGE"
+
+    if water_high:
+        return "HEAVY_FLOW"
+
+    if confirmed_blockage:
+        if mud_found and sand_found and plastic_found:
+            return "MUD_SAND_PLASTIC"
+        if mud_found and sand_found:
+            return "MUD_SAND"
+        if mud_found and plastic_found:
+            return "MUD_PLASTIC"
+        if sand_found and plastic_found:
+            return "SAND_PLASTIC"
+        if mud_found:
+            return "MUD_DETECTED"
+        if sand_found:
+            return "SAND_DETECTED"
+        if plastic_found:
+            return "PLASTIC_DETECTED"
+
+    return None
+
+
+# ============================================================
+# SMS MESSAGE CREATION
+# ============================================================
+
+def build_alert_message(
+    alert_type,
+    level,
+    flow,
+    mud_confidence,
+    sand_confidence,
+    plastic_confidence
+):
+    level_text = f"{level:.1f} cm" if level is not None else "N/A"
+    flow_text = f"{flow:.2f} L/min" if flow is not None else "N/A"
+
+    titles = {
+        "HEAVY_FLOW": "HEAVY WATER FLOW",
+        "MUD_BLOCKAGE": "MUD/BLOCKAGE",
+        "MUD_DETECTED": "MUD DETECTED",
+        "SAND_DETECTED": "SAND DETECTED",
+        "PLASTIC_DETECTED": "PLASTIC DETECTED",
+        "MUD_SAND": "MUD + SAND DETECTED",
+        "MUD_PLASTIC": "MUD + PLASTIC DETECTED",
+        "SAND_PLASTIC": "SAND + PLASTIC DETECTED",
+        "MUD_SAND_PLASTIC": "MUD + SAND + PLASTIC DETECTED"
+    }
+
+    return (
+        "DRAIN ALERT\n"
+        f"{titles.get(alert_type, alert_type)}\n"
+        f"Water Level: {level_text}\n"
+        f"Water Flow: {flow_text}\n"
+        f"Mud: {mud_confidence:.0%}\n"
+        f"Sand: {sand_confidence:.0%}\n"
+        f"Plastic: {plastic_confidence:.0%}\n"
+        "Check/inspect drain."
+    )
+
+
+def build_telegram_alert_message(
+    alert_type,
+    level,
+    flow,
+    mud_confidence,
+    sand_confidence,
+    plastic_confidence
+):
+    level_text = f"{level:.1f} cm" if level is not None else "N/A"
+    flow_text = f"{flow:.2f} L/min" if flow is not None else "N/A"
+
+    titles = {
+        "HEAVY_FLOW": "🚨 HEAVY WATER FLOW ALERT",
+        "MUD_BLOCKAGE": "🚨 MUD BLOCKAGE ALERT",
+        "MUD_DETECTED": "⚠️ MUD DETECTED",
+        "SAND_DETECTED": "⚠️ SAND DETECTED",
+        "PLASTIC_DETECTED": "⚠️ PLASTIC DETECTED",
+        "MUD_SAND": "⚠️ MUD + SAND DETECTED",
+        "MUD_PLASTIC": "⚠️ MUD + PLASTIC DETECTED",
+        "SAND_PLASTIC": "⚠️ SAND + PLASTIC DETECTED",
+        "MUD_SAND_PLASTIC": "🚨 MUD + SAND + PLASTIC ALERT"
+    }
+
+    return (
+        f"{titles.get(alert_type, '🚨 ' + str(alert_type))}\n\n"
+        f"Device: {DEVICE_NAME}\n"
+        f"Device ID: {DEVICE_ID}\n\n"
+        f"Water Level: {level_text}\n"
+        f"Water Flow: {flow_text}\n\n"
+        f"Mud Confidence: {mud_confidence:.1%}\n"
+        f"Sand Confidence: {sand_confidence:.1%}\n"
+        f"Plastic Confidence: {plastic_confidence:.1%}\n\n"
+        f"Time: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}\n\n"
+        "📸 Incident snapshot is attached."
+    )
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+try:
+
+    while True:
+
+        # Current time is needed by the dashboard API timer
+        # and the SMS alert timer.
+        current_time = time.time()
+
+        # ====================================================
+        # CAMERA FRAME
+        # ====================================================
+
+        frame = picam2.capture_array()
+
+        output = frame.copy()
+
+
+        # ====================================================
+        # SENSOR DATA
+        # ====================================================
+
+        with data_lock:
+
+            temperature = (
+                sensor_data[
+                    "temperature"
+                ]
+            )
+
+            mq135 = (
+                sensor_data[
+                    "mq135"
+                ]
+            )
+
+            distance = (
+                sensor_data[
+                    "distance"
+                ]
+            )
+
+            level = (
+                sensor_data[
+                    "level"
+                ]
+            )
+
+            flow = (
+                sensor_data[
+                    "flow"
+                ]
+            )
+
+
+        # ====================================================
+        # HIGH WATER CONFIRMATION
+        # ====================================================
+
+        water_high_now = (
+            level is not None
+            and
+            level >= WATER_LEVEL_HIGH_CM
+        )
+
+        if water_high_now:
+
+            high_water_count += 1
+
+        else:
+
+            high_water_count = 0
+
+            # Reset the event after water returns to normal.
+            if event_reset is False:
+
+                event_reset = True
+                last_alert_type = None
+
+                print()
+                print(
+                    "Water returned to normal."
+                )
+                print(
+                    "Alert event RESET."
+                )
+
+
+        confirmed_high_water = (
+            high_water_count
+            >=
+            HIGH_WATER_CONFIRM_READINGS
+        )
+
+
+        # ====================================================
+        # DRAIN YOLO
+        # ====================================================
+
+        drain_result = drain_model.predict(
+            source=frame,
+            imgsz=416,
+            conf=YOLO_CONFIDENCE,
+            verbose=False
+        )[0]
+
+
+        # ====================================================
+        # TRASH YOLO
+        # ====================================================
+
+        trash_result = trash_model.predict(
+            source=frame,
+            imgsz=416,
+            conf=YOLO_CONFIDENCE,
+            verbose=False
+        )[0]
+
+
+        # ====================================================
+        # MUD DETECTION
+        # ====================================================
+
+        mud_found = False
+        mud_confidence = 0.0
+
+        for box in drain_result.boxes:
+
+            cls = int(
+                box.cls[0]
+            )
+
+            conf = float(
+                box.conf[0]
+            )
+
+            name = str(
+                drain_model.names[cls]
+            )
+
+            if (
+                name.lower()
+                !=
+                MUD_CLASS.lower()
+            ):
+                continue
+
+            mud_found = True
+
+            mud_confidence = max(
+                mud_confidence,
+                conf
+            )
+
+            x1, y1, x2, y2 = map(
+                int,
+                box.xyxy[0]
+            )
+
+            cv2.rectangle(
+                output,
+                (x1, y1),
+                (x2, y2),
+                (255, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                output,
+                f"MUD BUILDUP {conf:.0%}",
+                (
+                    x1,
+                    max(
+                        y1 - 10,
+                        20
+                    )
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (255, 255, 255),
+                2
+            )
+
+
+        # ====================================================
+        # SAND DETECTION
+        # ====================================================
+
+        sand_found = False
+        sand_confidence = 0.0
+
+        accepted_sand_classes = {
+            x.lower()
+            for x in SAND_CLASSES
         }
 
-      }
-    );
+        for box in drain_result.boxes:
 
-    ws.on(
-      "error",
-      (error) => {
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+            name = str(drain_model.names[cls])
 
-        console.error(
-          "Camera WebSocket error:",
-          error.message
-        );
+            if name.lower() not in accepted_sand_classes:
+                continue
 
-      }
-    );
+            sand_found = True
+            sand_confidence = max(sand_confidence, conf)
 
-  }
-);
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-// ======================================
-// START SERVER
-// ======================================
+            cv2.rectangle(
+                output,
+                (x1, y1),
+                (x2, y2),
+                (255, 255, 255),
+                2
+            )
 
-server.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
+            cv2.putText(
+                output,
+                f"SAND {conf:.0%}",
+                (x1, max(y1 - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (255, 255, 255),
+                2
+            )
 
-    console.log(
-      `DrainWatch API running on port ${PORT}`
-    );
 
-    console.log(
-      "Camera WebSocket: /ws/camera"
-    );
+        # ====================================================
+        # PLASTIC TRASH DETECTION
+        # ====================================================
 
-  }
-);
+        plastic_found = False
+        plastic_confidence = 0.0
+
+        accepted_plastic_classes = {
+            x.lower()
+            for x in PLASTIC_CLASSES
+        }
+
+        for box in trash_result.boxes:
+
+            cls = int(
+                box.cls[0]
+            )
+
+            conf = float(
+                box.conf[0]
+            )
+
+            name = str(
+                trash_model.names[cls]
+            )
+
+            if (
+                name.lower()
+                not in
+                accepted_plastic_classes
+            ):
+                continue
+
+            plastic_found = True
+
+            plastic_confidence = max(
+                plastic_confidence,
+                conf
+            )
+
+            x1, y1, x2, y2 = map(
+                int,
+                box.xyxy[0]
+            )
+
+            cv2.rectangle(
+                output,
+                (x1, y1),
+                (x2, y2),
+                (255, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                output,
+                f"PLASTIC TRASH {conf:.0%}",
+                (
+                    x1,
+                    min(
+                        y2 + 20,
+                        470
+                    )
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (255, 255, 255),
+                2
+            )
+
+
+        # ====================================================
+        # BLOCKAGE CONFIRMATION
+        # ====================================================
+        #
+        # A single camera detection is not immediately treated
+        # as a blockage alert. It must be present over several
+        # consecutive frames.
+        #
+        # Mud is the primary blockage indication.
+        # Plastic trash is also treated as physical obstruction
+        # when water is high.
+        # ====================================================
+
+        visual_blockage_now = (
+            mud_found
+            or
+            sand_found
+            or
+            plastic_found
+        )
+
+        if visual_blockage_now:
+
+            blockage_count += 1
+
+        else:
+
+            blockage_count = 0
+
+        confirmed_blockage = (
+            blockage_count
+            >=
+            BLOCKAGE_CONFIRM_FRAMES
+        )
+
+
+        # ====================================================
+        # DETECTION STATUS
+        # ====================================================
+
+        detected_items = []
+
+        if mud_found:
+            detected_items.append("MUD")
+
+        if sand_found:
+            detected_items.append("SAND")
+
+        if plastic_found:
+            detected_items.append("PLASTIC")
+
+        if detected_items:
+            detection_status = " + ".join(detected_items) + " DETECTED"
+        else:
+            detection_status = "NO TARGET DETECTED"
+
+
+        # ====================================================
+        # PROJECT ALERT DECISION
+        # ====================================================
+
+        alert_type = determine_alert(
+            confirmed_high_water,
+            flow,
+            mud_found,
+            sand_found,
+            plastic_found,
+            confirmed_blockage
+        )
+
+
+        # ====================================================
+        # HUMAN-READABLE SYSTEM STATUS
+        # ====================================================
+
+        if not confirmed_high_water:
+
+            system_status = (
+                "NORMAL / MONITORING"
+            )
+
+        elif confirmed_blockage:
+
+            system_status = (
+                "MUD / BLOCKAGE CONDITION"
+            )
+
+        elif (
+            flow is not None
+            and
+            flow >= HEAVY_FLOW_LPM
+        ):
+
+            system_status = (
+                "HEAVY WATER FLOW"
+            )
+
+        else:
+
+            system_status = (
+                "HIGH WATER - CAUSE UNCERTAIN"
+            )
+
+
+        # ====================================================
+        # DISPLAY TEXT
+        # ====================================================
+
+        level_text = (
+            f"{level:.1f} cm"
+            if level is not None
+            else
+            "NO DATA"
+        )
+
+        temp_text = (
+            f"{temperature:.1f} C"
+            if temperature is not None
+            else
+            "NO DATA"
+        )
+
+        mq_text = (
+            str(mq135)
+            if mq135 is not None
+            else
+            "NO DATA"
+        )
+
+        flow_text = (
+            f"{flow:.2f} L/min"
+            if flow is not None
+            else
+            "NO DATA"
+        )
+
+
+        # ====================================================
+        # CAMERA OVERLAY
+        # ====================================================
+
+        cv2.putText(
+            output,
+            f"STATUS: {system_status}",
+            (10, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            (255, 255, 255),
+            2
+        )
+
+
+        # ====================================================
+        # TERMINAL STATUS
+        # ====================================================
+
+        mud_text = (
+            f"MUD {mud_confidence:.0%}"
+            if mud_found
+            else
+            "MUD None"
+        )
+
+        sand_text = (
+            f"SAND {sand_confidence:.0%}"
+            if sand_found
+            else
+            "SAND None"
+        )
+
+        plastic_text = (
+            f"PLASTIC {plastic_confidence:.0%}"
+            if plastic_found
+            else
+            "PLASTIC None"
+        )
+
+        alert_text = (
+            alert_type
+            if alert_type is not None
+            else
+            "NONE"
+        )
+
+        print(
+            "\r"
+            f"LEVEL={level_text} | "
+            f"FLOW={flow_text} | "
+            f"{mud_text} | "
+            f"{sand_text} | "
+            f"{plastic_text} | "
+            f"STATUS={system_status} | "
+            f"ALERT={alert_text}",
+            end="",
+            flush=True
+        )
+
+
+        # ====================================================
+        # SEND LIVE DATA TO DASHBOARD
+        # ====================================================
+
+        if (
+            current_time - last_data_api_time
+            >= DATA_API_INTERVAL
+        ):
+
+            send_dashboard_data(
+                level,
+                flow,
+                temperature,
+                mq135,
+                system_status
+            )
+
+            last_data_api_time = current_time
+
+
+        # ====================================================
+        # ALERT CONTROL: SMS + TELEGRAM + SNAPSHOT
+        # ====================================================
+
+        should_send = False
+
+        if alert_type is not None:
+
+            if event_reset:
+                should_send = True
+
+            elif (
+                alert_type == last_alert_type
+                and
+                current_time - last_alert_time >= SMS_COOLDOWN
+            ):
+                should_send = True
+
+            elif alert_type != last_alert_type:
+                should_send = True
+
+        if should_send:
+
+            sms_message = build_alert_message(
+                alert_type,
+                level,
+                flow,
+                mud_confidence,
+                sand_confidence,
+                plastic_confidence
+            )
+
+            telegram_message = build_telegram_alert_message(
+                alert_type,
+                level,
+                flow,
+                mud_confidence,
+                sand_confidence,
+                plastic_confidence
+            )
+
+            print()
+            print()
+            print("******** ALERT DECISION ********")
+            print(f"ALERT TYPE: {alert_type}")
+            print("********************************")
+
+            # 1. Save the current camera frame with YOLO labels.
+            snapshot_timestamp = datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+            snapshot_filename = (
+                f"{snapshot_timestamp}_{alert_type}.jpg"
+            )
+
+            snapshot_path = os.path.join(
+                SNAPSHOT_FOLDER,
+                snapshot_filename
+            )
+
+            if cv2.imwrite(snapshot_path, output):
+                print(f"📸 Snapshot saved: {snapshot_path}")
+            else:
+                print("❌ Snapshot could not be saved.")
+                snapshot_path = None
+
+            # 2. Send SMS through A7670C.
+            sms_success = False
+
+            if gsm_ready:
+                sms_success = send_sms(sms_message)
+            else:
+                print("GSM unavailable - SMS not sent.")
+
+            # 3. Send Telegram text.
+            telegram_success = send_telegram_message(
+                telegram_message
+            )
+
+            # 4. Send the snapshot to Telegram.
+            telegram_snapshot_success = False
+
+            if snapshot_path is not None:
+
+                snapshot_level = (
+                    f"{level:.1f} cm"
+                    if level is not None
+                    else "N/A"
+                )
+
+                snapshot_caption = (
+                    f"📸 {alert_type}\n"
+                    f"Device: {DEVICE_NAME}\n"
+                    f"Water Level: {snapshot_level}\n"
+                    f"Time: "
+                    f"{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
+                )
+
+                telegram_snapshot_success = send_telegram_snapshot(
+                    snapshot_path,
+                    snapshot_caption
+                )
+
+            # 5. Record the alert in the dashboard.
+            dashboard_success = send_dashboard_alert(
+                alert_type,
+                level,
+                flow,
+                mud_confidence,
+                plastic_confidence
+            )
+
+            print()
+            print("ALERT DELIVERY RESULT")
+            print(
+                "SMS       :",
+                "SUCCESS" if sms_success else "FAILED"
+            )
+            print(
+                "Telegram  :",
+                "SUCCESS" if telegram_success else "FAILED"
+            )
+            print(
+                "Snapshot  :",
+                "SUCCESS" if telegram_snapshot_success else "FAILED"
+            )
+            print(
+                "Dashboard :",
+                "SUCCESS" if dashboard_success else "FAILED"
+            )
+
+            # SMS and Telegram are independent.
+            if sms_success or telegram_success:
+
+                last_alert_type = alert_type
+                last_alert_time = time.time()
+                event_reset = False
+
+                print("Alert recorded for this event.")
+
+            else:
+                print(
+                    "SMS and Telegram both failed. "
+                    "Alert will be retried."
+                )
+
+
+        # ============================================================
+        # DISPLAY
+        # ============================================================
+
+        cv2.imshow(
+            "SMART DRAIN MONITORING SYSTEM",
+            output
+        )
+
+
+        # ====================================================
+        # QUIT
+        # ====================================================
+
+        key = (
+            cv2.waitKey(1)
+            &
+            0xFF
+        )
+
+        if key == ord("q"):
+
+            break
+
+
+except KeyboardInterrupt:
+
+    print()
+    print(
+        "Keyboard interrupt received."
+    )
+
+
+finally:
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    print()
+    print()
+    print(
+        "Stopping system..."
+    )
+
+    try:
+
+        picam2.stop()
+
+    except Exception:
+        pass
+
+    cv2.destroyAllWindows()
+
+    if esp_serial is not None:
+
+        try:
+
+            esp_serial.close()
+
+        except Exception:
+            pass
+
+    if gsm_serial is not None:
+
+        try:
+
+            gsm_serial.close()
+
+        except Exception:
+            pass
+
+    print(
+        "System stopped."
+    )
