@@ -6,6 +6,9 @@ import { WebSocketServer, WebSocket } from "ws";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
+const SUPABASE_DRAIN_ID =
+  "e4820f2d-9dbb-482f-b6c1-d9f2c7890d6b";
+
 const app = express();
 
 app.use(cors());
@@ -13,17 +16,17 @@ app.use(express.json({ limit: "15mb" }));
 
 const PORT = process.env.PORT || 10000;
 
-// ======================================
-// TEMPORARY IN-MEMORY STORAGE
-// ======================================
+// ==================================================
+// TEMPORARY LIVE STORAGE
+// ==================================================
 
 let sensorData = [];
 let detections = [];
 let alerts = [];
 
-// ======================================
+// ==================================================
 // CAMERA STORAGE
-// ======================================
+// ==================================================
 
 const cameraFrames = new Map();
 const cameraSnapshots = new Map();
@@ -33,9 +36,94 @@ let nextSnapshotId = 1;
 const MAX_SNAPSHOTS = 100;
 const CAMERA_FRAME_TIMEOUT_MS = 5000;
 
-// ======================================
+// ==================================================
+// SUPABASE SENSOR STORAGE
+// ==================================================
+
+async function saveSensorDataToSupabase(data) {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      console.error("Supabase environment variables are missing.");
+      return false;
+    }
+
+    const payload = {
+      drain_id: SUPABASE_DRAIN_ID,
+
+      gas_ppm:
+        data.gas_ppm !== undefined &&
+        data.gas_ppm !== null
+          ? Number(data.gas_ppm)
+          : null,
+
+      water_distance_cm:
+        data.water_distance_cm !== undefined &&
+        data.water_distance_cm !== null
+          ? Number(data.water_distance_cm)
+          : null,
+
+      water_level_pct:
+        data.water_level_pct !== undefined &&
+        data.water_level_pct !== null
+          ? Number(data.water_level_pct)
+          : null,
+
+      temperature_c:
+        data.temperature_c !== undefined &&
+        data.temperature_c !== null
+          ? Number(data.temperature_c)
+          : null,
+
+      created_at: new Date().toISOString()
+    };
+
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/sensor_readings`,
+      {
+        method: "POST",
+
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal"
+        },
+
+        body: JSON.stringify(payload)
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+
+      console.error(
+        "SUPABASE SENSOR SAVE FAILED:",
+        response.status,
+        errorText
+      );
+
+      return false;
+    }
+
+    console.log(
+      "SUPABASE: Sensor data saved successfully"
+    );
+
+    return true;
+
+  } catch (error) {
+    console.error(
+      "SUPABASE SENSOR ERROR:",
+      error.message
+    );
+
+    return false;
+  }
+}
+
+// ==================================================
 // TEST API
-// ======================================
+// ==================================================
 
 app.get("/", (req, res) => {
   res.json({
@@ -44,9 +132,9 @@ app.get("/", (req, res) => {
   });
 });
 
-// ======================================
+// ==================================================
 // HEALTH CHECK
-// ======================================
+// ==================================================
 
 app.get("/api/health", (req, res) => {
   res.json({
@@ -55,34 +143,96 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// ======================================
+// ==================================================
 // RECEIVE SENSOR DATA
-// ======================================
+// ==================================================
 
-app.post("/api/data", (req, res) => {
-  const data = {
-    ...req.body,
-    received_at: new Date().toISOString()
-  };
+app.post("/api/data", async (req, res) => {
+  try {
+    const data = {
+      ...req.body,
+      received_at: new Date().toISOString()
+    };
 
-  console.log("Received sensor data:", data);
+    console.log(
+      "======================================"
+    );
 
-  sensorData.push(data);
+    console.log(
+      "RECEIVED SENSOR DATA FROM AXON"
+    );
 
-  if (sensorData.length > 1000) {
-    sensorData.shift();
+    console.log(
+      "======================================"
+    );
+
+    console.log("Device:", data.device_id || "unknown");
+
+    console.log(
+      "Water:",
+      data.water_distance_cm ?? "N/A",
+      "cm"
+    );
+
+    console.log(
+      "Temperature:",
+      data.temperature_c ?? "N/A",
+      "C"
+    );
+
+    console.log(
+      "Gas:",
+      data.gas_ppm ?? "N/A",
+      "ppm"
+    );
+
+    console.log(
+      "======================================"
+    );
+
+    // ------------------------------------------
+    // KEEP LIVE DASHBOARD WORKING
+    // ------------------------------------------
+
+    sensorData.push(data);
+
+    if (sensorData.length > 1000) {
+      sensorData.shift();
+    }
+
+    // ------------------------------------------
+    // SAVE PERMANENT HISTORY TO SUPABASE
+    // ------------------------------------------
+
+    await saveSensorDataToSupabase(data);
+
+    // ------------------------------------------
+    // SEND RESPONSE TO AXON
+    // ------------------------------------------
+
+    return res.status(200).json({
+      status: "success",
+      message: "Data received successfully",
+      data: data
+    });
+
+  } catch (error) {
+
+    console.error(
+      "SENSOR DATA ERROR:",
+      error
+    );
+
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to process sensor data"
+    });
   }
-
-  res.json({
-    status: "success",
-    message: "Data received successfully",
-    data: data
-  });
 });
 
-// ======================================
-// GET SENSOR DATA
-// ======================================
+// ==================================================
+// GET LIVE SENSOR DATA
+// ==================================================
 
 app.get("/api/data", (req, res) => {
   res.json({
@@ -91,11 +241,12 @@ app.get("/api/data", (req, res) => {
   });
 });
 
-// ======================================
+// ==================================================
 // DEVICE HISTORY
-// ======================================
+// ==================================================
 
 app.get("/api/data/:device_id", (req, res) => {
+
   const deviceId = req.params.device_id;
 
   const deviceData = sensorData.filter(
@@ -109,17 +260,21 @@ app.get("/api/data/:device_id", (req, res) => {
   });
 });
 
-// ======================================
+// ==================================================
 // RECEIVE CAMERA DETECTIONS
-// ======================================
+// ==================================================
 
 app.post("/api/detections", (req, res) => {
+
   const detection = {
     ...req.body,
     received_at: new Date().toISOString()
   };
 
-  console.log("Received detection:", detection);
+  console.log(
+    "Received detection:",
+    detection
+  );
 
   detections.push(detection);
 
@@ -134,22 +289,25 @@ app.post("/api/detections", (req, res) => {
   });
 });
 
-// ======================================
+// ==================================================
 // GET CAMERA DETECTIONS
-// ======================================
+// ==================================================
 
 app.get("/api/detections", (req, res) => {
+
   res.json({
     status: "success",
     data: detections
   });
+
 });
 
-// ======================================
+// ==================================================
 // RECEIVE ALERTS
-// ======================================
+// ==================================================
 
 app.post("/api/alerts", (req, res) => {
+
   try {
 
     const alert = {
@@ -157,28 +315,43 @@ app.post("/api/alerts", (req, res) => {
       received_at: new Date().toISOString()
     };
 
-    console.log("======================================");
-    console.log("RECEIVED ALERT FROM AXON");
-    console.log("======================================");
+    console.log(
+      "======================================"
+    );
+
+    console.log(
+      "RECEIVED ALERT FROM AXON"
+    );
+
+    console.log(
+      "======================================"
+    );
 
     console.log(
       "Device:",
-      alert.device_id || alert.drain_id || "unknown"
+      alert.device_id ||
+      alert.drain_id ||
+      "unknown"
     );
 
     console.log(
       "Alert Type:",
-      alert.alert_type || alert.type || "unknown"
+      alert.alert_type ||
+      alert.type ||
+      "unknown"
     );
 
     console.log(
       "Severity:",
-      alert.severity || "unknown"
+      alert.severity ||
+      "unknown"
     );
 
     console.log(
       "Message:",
-      alert.message || alert.description || ""
+      alert.message ||
+      alert.description ||
+      ""
     );
 
     console.log(
@@ -199,12 +372,12 @@ app.post("/api/alerts", (req, res) => {
       "cm"
     );
 
-    console.log("======================================");
+    console.log(
+      "======================================"
+    );
 
-    // Store alert
     alerts.push(alert);
 
-    // Keep maximum 1000 alerts
     if (alerts.length > 1000) {
       alerts.shift();
     }
@@ -226,13 +399,12 @@ app.post("/api/alerts", (req, res) => {
       status: "error",
       message: "Failed to receive alert"
     });
-
   }
 });
 
-// ======================================
+// ==================================================
 // GET ALERTS
-// ======================================
+// ==================================================
 
 app.get("/api/alerts", (req, res) => {
 
@@ -243,9 +415,9 @@ app.get("/api/alerts", (req, res) => {
 
 });
 
-// ======================================
+// ==================================================
 // GET FRESH CAMERA FRAME
-// ======================================
+// ==================================================
 
 function getFreshFrame(deviceId) {
 
@@ -255,7 +427,8 @@ function getFreshFrame(deviceId) {
     return null;
   }
 
-  const age = Date.now() - item.updatedAt;
+  const age =
+    Date.now() - item.updatedAt;
 
   if (age > CAMERA_FRAME_TIMEOUT_MS) {
 
@@ -267,31 +440,32 @@ function getFreshFrame(deviceId) {
   return item;
 }
 
-// ======================================
+// ==================================================
 // CAMERA STATUS
-// ======================================
+// ==================================================
 
 app.get("/api/camera/status", (req, res) => {
 
   const data = {};
 
-  for (const [deviceId, item] of cameraFrames.entries()) {
+  for (
+    const [deviceId, item]
+    of cameraFrames.entries()
+  ) {
 
-    const age = Date.now() - item.updatedAt;
+    const age =
+      Date.now() - item.updatedAt;
 
     if (age <= CAMERA_FRAME_TIMEOUT_MS) {
 
       data[deviceId] = {
-
         online: true,
-
         device_id: deviceId,
-
         device_name: item.deviceName,
-
         last_frame_at:
-          new Date(item.updatedAt).toISOString()
-
+          new Date(
+            item.updatedAt
+          ).toISOString()
       };
 
     } else {
@@ -308,16 +482,19 @@ app.get("/api/camera/status", (req, res) => {
 
 });
 
-// ======================================
+// ==================================================
 // GET SNAPSHOT LIST
-// ======================================
+// ==================================================
 
 app.get("/api/snapshots", (req, res) => {
 
-  const deviceId = req.query.device_id;
+  const deviceId =
+    req.query.device_id;
 
   let list =
-    Array.from(cameraSnapshots.values());
+    Array.from(
+      cameraSnapshots.values()
+    );
 
   if (deviceId) {
 
@@ -361,228 +538,221 @@ app.get("/api/snapshots", (req, res) => {
 
 });
 
-// ======================================
+// ==================================================
 // GET ONE SNAPSHOT
-// ======================================
+// ==================================================
 
-app.get("/api/snapshots/:id", (req, res) => {
-
-  const id =
-    Number(req.params.id);
-
-  const item =
-    cameraSnapshots.get(id);
-
-  if (!item) {
-
-    return res.status(404).json({
-
-      status: "error",
-
-      message:
-        "Snapshot not found"
-
-    });
-
-  }
-
-  res.setHeader(
-    "Content-Type",
-    item.contentType ||
-      "image/jpeg"
-  );
-
-  res.setHeader(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate, max-age=0"
-  );
-
-  return res.send(
-    item.buffer
-  );
-
-});
-
-// ======================================
-// RECEIVE SNAPSHOT FROM RASPBERRY PI
-// ======================================
-
-app.post("/api/snapshots/upload", (req, res) => {
-
-  try {
-
-    const {
-      device_id,
-      device_name,
-      filename,
-      captured_at,
-      content_type,
-      image_base64
-    } = req.body || {};
-
-    if (
-      !device_id ||
-      !image_base64
-    ) {
-
-      return res.status(400).json({
-
-        status: "error",
-
-        message:
-          "device_id and image_base64 are required"
-
-      });
-
-    }
-
-    const cleanBase64 =
-      String(image_base64).replace(
-        /^data:image\/[^;]+;base64,/i,
-        ""
-      );
-
-    const buffer =
-      Buffer.from(
-        cleanBase64,
-        "base64"
-      );
-
-    if (!buffer.length) {
-
-      return res.status(400).json({
-
-        status: "error",
-
-        message:
-          "Invalid image data"
-
-      });
-
-    }
+app.get(
+  "/api/snapshots/:id",
+  (req, res) => {
 
     const id =
-      nextSnapshotId++;
+      Number(req.params.id);
 
-    const item = {
+    const item =
+      cameraSnapshots.get(id);
 
-      id: id,
+    if (!item) {
 
-      device_id:
-        String(device_id),
-
-      device_name:
-        String(
-          device_name ||
-          device_id
-        ),
-
-      filename:
-        String(
-          filename ||
-          `snapshot_${id}.jpg`
-        ),
-
-      captured_at:
-        captured_at ||
-        new Date().toISOString(),
-
-      contentType:
-        content_type ||
-        "image/jpeg",
-
-      buffer:
-        buffer
-
-    };
-
-    cameraSnapshots.set(
-      id,
-      item
-    );
-
-    while (
-      cameraSnapshots.size >
-      MAX_SNAPSHOTS
-    ) {
-
-      const oldestId =
-        cameraSnapshots
-          .keys()
-          .next()
-          .value;
-
-      cameraSnapshots.delete(
-        oldestId
-      );
+      return res.status(404).json({
+        status: "error",
+        message: "Snapshot not found"
+      });
 
     }
 
-    console.log(
-      `Snapshot received: ${item.device_id} #${item.id}`
+    res.setHeader(
+      "Content-Type",
+      item.contentType ||
+      "image/jpeg"
     );
 
-    return res.json({
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate, max-age=0"
+    );
 
-      status: "success",
+    return res.send(
+      item.buffer
+    );
 
-      message:
-        "Snapshot uploaded successfully",
+  }
+);
 
-      data: {
+// ==================================================
+// RECEIVE SNAPSHOT FROM RASPBERRY PI
+// ==================================================
 
-        id:
-          item.id,
+app.post(
+  "/api/snapshots/upload",
+  (req, res) => {
 
-        device_id:
-          item.device_id,
+    try {
 
-        device_name:
-          item.device_name,
+      const {
+        device_id,
+        device_name,
+        filename,
+        captured_at,
+        content_type,
+        image_base64
+      } = req.body || {};
 
-        filename:
-          item.filename,
+      if (
+        !device_id ||
+        !image_base64
+      ) {
 
-        captured_at:
-          item.captured_at,
-
-        url:
-          `/api/snapshots/${item.id}`
+        return res.status(400).json({
+          status: "error",
+          message:
+            "device_id and image_base64 are required"
+        });
 
       }
 
-    });
+      const cleanBase64 =
+        String(image_base64).replace(
+          /^data:image\/[^;]+;base64,/i,
+          ""
+        );
 
-  } catch (error) {
+      const buffer =
+        Buffer.from(
+          cleanBase64,
+          "base64"
+        );
 
-    console.error(
-      "Snapshot upload error:",
-      error
-    );
+      if (!buffer.length) {
 
-    return res.status(500).json({
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid image data"
+        });
 
-      status: "error",
+      }
 
-      message:
-        "Snapshot upload failed"
+      const id =
+        nextSnapshotId++;
 
-    });
+      const item = {
+
+        id: id,
+
+        device_id:
+          String(device_id),
+
+        device_name:
+          String(
+            device_name ||
+            device_id
+          ),
+
+        filename:
+          String(
+            filename ||
+            `snapshot_${id}.jpg`
+          ),
+
+        captured_at:
+          captured_at ||
+          new Date().toISOString(),
+
+        contentType:
+          content_type ||
+          "image/jpeg",
+
+        buffer: buffer
+
+      };
+
+      cameraSnapshots.set(
+        id,
+        item
+      );
+
+      while (
+        cameraSnapshots.size >
+        MAX_SNAPSHOTS
+      ) {
+
+        const oldestId =
+          cameraSnapshots
+            .keys()
+            .next()
+            .value;
+
+        cameraSnapshots.delete(
+          oldestId
+        );
+
+      }
+
+      console.log(
+        `Snapshot received: ${item.device_id} #${item.id}`
+      );
+
+      return res.json({
+
+        status: "success",
+
+        message:
+          "Snapshot uploaded successfully",
+
+        data: {
+
+          id: item.id,
+
+          device_id:
+            item.device_id,
+
+          device_name:
+            item.device_name,
+
+          filename:
+            item.filename,
+
+          captured_at:
+            item.captured_at,
+
+          url:
+            `/api/snapshots/${item.id}`
+
+        }
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Snapshot upload error:",
+        error
+      );
+
+      return res.status(500).json({
+
+        status: "error",
+
+        message:
+          "Snapshot upload failed"
+
+      });
+
+    }
 
   }
+);
 
-});
-
-// ======================================
+// ==================================================
 // CREATE HTTP SERVER
-// ======================================
+// ==================================================
 
 const server =
   http.createServer(app);
 
-// ======================================
+// ==================================================
 // CAMERA WEBSOCKET SERVER
-// ======================================
+// ==================================================
 
 const cameraWss =
   new WebSocketServer({
@@ -593,27 +763,21 @@ const cameraWss =
 
   });
 
-// ======================================
+// ==================================================
 // WEBSOCKET CONNECTION
-// ======================================
+// ==================================================
 
 cameraWss.on(
   "connection",
   (ws) => {
 
     ws.role = null;
-
     ws.deviceId = null;
-
     ws.deviceName = null;
 
     console.log(
       "Camera WebSocket connected"
     );
-
-    // ====================================
-    // RECEIVE MESSAGE
-    // ====================================
 
     ws.on(
       "message",
@@ -621,9 +785,9 @@ cameraWss.on(
 
         try {
 
-          // ==================================
+          // --------------------------------
           // TEXT MESSAGE
-          // ==================================
+          // --------------------------------
 
           if (!isBinary) {
 
@@ -632,19 +796,17 @@ cameraWss.on(
                 message.toString()
               );
 
-            // -------------------------------
+            // ------------------------------
             // RASPBERRY PI REGISTRATION
-            // -------------------------------
+            // ------------------------------
 
             if (
-              data.type ===
-              "register"
+              data.type === "register"
             ) {
 
               const deviceId =
                 String(
-                  data.device_id ||
-                  ""
+                  data.device_id || ""
                 );
 
               const deviceName =
@@ -693,19 +855,17 @@ cameraWss.on(
               return;
             }
 
-            // -------------------------------
+            // ------------------------------
             // BROWSER VIEWER REGISTRATION
-            // -------------------------------
+            // ------------------------------
 
             if (
-              data.type ===
-              "viewer"
+              data.type === "viewer"
             ) {
 
               const deviceId =
                 String(
-                  data.device_id ||
-                  ""
+                  data.device_id || ""
                 );
 
               if (!deviceId) {
@@ -740,9 +900,6 @@ cameraWss.on(
                 `Camera viewer registered: ${deviceId}`
               );
 
-              // Send latest frame
-              // immediately
-
               const frame =
                 getFreshFrame(
                   deviceId
@@ -769,9 +926,9 @@ cameraWss.on(
             return;
           }
 
-          // ==================================
+          // --------------------------------
           // BINARY MESSAGE = CAMERA FRAME
-          // ==================================
+          // --------------------------------
 
           if (
             ws.role !== "pi" ||
@@ -779,28 +936,18 @@ cameraWss.on(
           ) {
 
             return;
-
           }
 
           const buffer =
-            Buffer.from(
-              message
-            );
+            Buffer.from(message);
 
           if (!buffer.length) {
-
             return;
-
           }
 
-          // Store latest frame
-
           cameraFrames.set(
-
             ws.deviceId,
-
             {
-
               deviceId:
                 ws.deviceId,
 
@@ -816,93 +963,68 @@ cameraWss.on(
 
               producer:
                 ws
-
             }
-
           );
 
-          // ==================================
+          // --------------------------------
           // SEND FRAME TO VIEWERS
-          // ==================================
+          // --------------------------------
 
           for (
             const client of
             cameraWss.clients
           ) {
 
-            if (
-              client === ws
-            ) {
-
+            if (client === ws) {
               continue;
-
             }
 
             if (
               client.readyState !==
               WebSocket.OPEN
             ) {
-
               continue;
-
             }
 
             if (
               client.role !==
               "viewer"
             ) {
-
               continue;
-
             }
 
             if (
               client.deviceId !==
               ws.deviceId
             ) {
-
               continue;
-
             }
 
             try {
 
               client.send(
-
                 buffer,
-
                 {
                   binary: true
                 }
-
               );
 
-            } catch (
-              error
-            ) {
+            } catch (error) {
 
               console.error(
-
                 "Viewer send error:",
-
                 error.message
-
               );
 
             }
 
           }
 
-        } catch (
-          error
-        ) {
+        } catch (error) {
 
           console.error(
-
             "Camera WebSocket message error:",
-
             error.message
-
           );
 
         }
@@ -910,24 +1032,20 @@ cameraWss.on(
       }
     );
 
-    // ====================================
+    // --------------------------------
     // WEBSOCKET CLOSED
-    // ====================================
+    // --------------------------------
 
     ws.on(
       "close",
       () => {
 
         console.log(
-
           `Camera WebSocket closed: ${
-            ws.deviceId ||
-            "unknown"
+            ws.deviceId || "unknown"
           } (${
-            ws.role ||
-            "unknown"
+            ws.role || "unknown"
           })`
-
         );
 
         if (
@@ -956,20 +1074,17 @@ cameraWss.on(
       }
     );
 
-    // ====================================
+    // --------------------------------
     // WEBSOCKET ERROR
-    // ====================================
+    // --------------------------------
 
     ws.on(
       "error",
       (error) => {
 
         console.error(
-
           "Camera WebSocket error:",
-
           error.message
-
         );
 
       }
@@ -978,16 +1093,13 @@ cameraWss.on(
   }
 );
 
-// ======================================
+// ==================================================
 // START SERVER
-// ======================================
+// ==================================================
 
 server.listen(
-
   PORT,
-
   "0.0.0.0",
-
   () => {
 
     console.log(
@@ -998,6 +1110,9 @@ server.listen(
       "Camera WebSocket: /ws/camera"
     );
 
-  }
+    console.log(
+      "Supabase history storage: ENABLED"
+    );
 
+  }
 );
