@@ -122,6 +122,87 @@ async function saveSensorDataToSupabase(data) {
 }
 
 // ==================================================
+// SUPABASE ALERT STORAGE
+// ==================================================
+
+async function saveAlertToSupabase(alert) {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      console.error("Supabase environment variables are missing.");
+      return false;
+    }
+
+    const alertType =
+      alert.alert_type ||
+      alert.type ||
+      "unknown";
+
+    const severity =
+      ["low", "medium", "high", "critical"].includes(
+        alert.severity
+      )
+        ? alert.severity
+        : "high";
+
+    const payload = {
+      drain_id: SUPABASE_DRAIN_ID,
+      type: alertType,
+      severity: severity,
+      message:
+        alert.message ||
+        alert.description ||
+        "Drain monitoring alert",
+      acknowledged: false,
+      created_at:
+        alert.created_at ||
+        new Date().toISOString()
+    };
+
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/alerts`,
+      {
+        method: "POST",
+
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal"
+        },
+
+        body: JSON.stringify(payload)
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+
+      console.error(
+        "SUPABASE ALERT SAVE FAILED:",
+        response.status,
+        errorText
+      );
+
+      return false;
+    }
+
+    console.log(
+      "SUPABASE: Alert saved successfully"
+    );
+
+    return true;
+
+  } catch (error) {
+    console.error(
+      "SUPABASE ALERT ERROR:",
+      error.message
+    );
+
+    return false;
+  }
+}
+
+// ==================================================
 // TEST API
 // ==================================================
 
@@ -166,7 +247,10 @@ app.post("/api/data", async (req, res) => {
       "======================================"
     );
 
-    console.log("Device:", data.device_id || "unknown");
+    console.log(
+      "Device:",
+      data.device_id || "unknown"
+    );
 
     console.log(
       "Water:",
@@ -190,25 +274,13 @@ app.post("/api/data", async (req, res) => {
       "======================================"
     );
 
-    // ------------------------------------------
-    // KEEP LIVE DASHBOARD WORKING
-    // ------------------------------------------
-
     sensorData.push(data);
 
     if (sensorData.length > 1000) {
       sensorData.shift();
     }
 
-    // ------------------------------------------
-    // SAVE PERMANENT HISTORY TO SUPABASE
-    // ------------------------------------------
-
     await saveSensorDataToSupabase(data);
-
-    // ------------------------------------------
-    // SEND RESPONSE TO AXON
-    // ------------------------------------------
 
     return res.status(200).json({
       status: "success",
@@ -306,7 +378,7 @@ app.get("/api/detections", (req, res) => {
 // RECEIVE ALERTS
 // ==================================================
 
-app.post("/api/alerts", (req, res) => {
+app.post("/api/alerts", async (req, res) => {
 
   try {
 
@@ -377,6 +449,8 @@ app.post("/api/alerts", (req, res) => {
     );
 
     alerts.push(alert);
+
+    await saveAlertToSupabase(alert);
 
     if (alerts.length > 1000) {
       alerts.shift();
